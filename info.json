@@ -1,0 +1,9 @@
+{
+  "name": "creative-pollution",
+  "version": "0.1.2",
+  "title": "Creative Pollution",
+  "author": "Evan Gipson",
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.1.0"],
+  "description": "Dump oil, lubricant and acid straight into the water through outfall pipes. Tainted water spreads with the volume dumped, yields a different fluid from offshore pumps, and can only be reclaimed by piping in chlorine once the dumping has stopped."
+}
