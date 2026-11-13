@@ -1,4 +1,4 @@
-local config = require("config")
+local variants = require("variants")
 
 -- Ground tiles list by name which water tiles they draw a shoreline against, and deep water
 -- lists which tiles may sit next to it. Add every tainted tile wherever its clean original is
@@ -9,11 +9,10 @@ local all_clones = {}
 for name, tile in pairs(data.raw.tile) do
   if tile.fluid == "water" then
     local clones = {}
-    for _, pollutant in ipairs(config.pollutants) do
-      local clone = config.tainted_tile(pollutant.fluid, name)
-      if data.raw.tile[clone] then
-        clones[#clones + 1] = clone
-        all_clones[#all_clones + 1] = clone
+    for _, variant in ipairs(variants.for_source(name)) do
+      if data.raw.tile[variant.name] then
+        clones[#clones + 1] = variant.name
+        all_clones[#all_clones + 1] = variant.name
       end
     end
     clones_of[name] = clones

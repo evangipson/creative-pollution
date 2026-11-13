@@ -1,24 +1,31 @@
 local Config = require('config')
 local Game = require('game')
+local Variants = require('variants')
 
 local OUTFALL = Game.buildings.outfall_pump.name
 local CHLORINE = Game.fluids.chlorine.name
 local T = Config.tuning
+local STEPS = Config.taint_steps
 
 --[[
 How it works
 
 Every outfall is a small storage tank. Twice a second each one is emptied by this script:
 
-  * a pollutant goes into the outfall's `pending` ledger and is turned into tainted tiles,
-    nearest water first, at "units per tile" each. What has been turned into tiles moves to
-    the `load` ledger.
-  * chlorine is held in the outfall and turns tainted tiles back, nearest first, but only
-    while no outfall feeding the same slick has dumped a pollutant recently.
+  * a pollutant goes into the outfall's `pending` ledger and taints the water, nearest first.
+    Water is tainted one tint at a time (see variants.lua): each step makes a tile one level
+    stronger and costs 1 / STEPS of "units per tile", so a fully tainted tile costs exactly
+    "units per tile". What has been spent moves to the `load` ledger.
+  * chlorine is held in the outfall and treats tainted water the same way, one level at a time,
+    but only while no outfall feeding the same slick has dumped a pollutant recently.
   * anything else is simply voided.
 
-Outfalls whose slicks touch form a group. The group paints with whichever pollutant it has
-dumped the most of, and repaints tiles that show another pollutant for free.
+Every pass over the water moves each tile at most one step, so slicks fade in, mix and fade
+out instead of jumping from one colour to another.
+
+Outfalls whose slicks touch form a group. The group's water heads for a target tint: its two
+biggest pollutants blended in proportion to how much of each it has dumped. New water is tainted
+with the biggest one. Fully tainted water shifts toward the target blend for free.
 
 The tiles themselves are the state of the water: nothing per tile is stored in `storage`.
 
@@ -33,7 +40,7 @@ storage.outfalls[unit_number] =
   taint = {radius = n, ...},     -- search state for water to taint
   clean = {radius = n, ...},     -- search state for water to treat
   queue, qi, queue_tag,          -- tiles found by the last search, nearest first
-  paint, repaint,                -- the pollutant its group paints with
+  target, repaint,               -- the tint its group heads for (see assign_groups)
   group_active, blocked,         -- set every update by assign_groups
   last_dump_tick, sees_chlorine, status
 }
@@ -45,16 +52,29 @@ storage.outfalls[unit_number] =
 
 local maps
 
+-- A tint is named by a short key, the same for every clean water tile:
+--   "clean"       untainted
+--   "p<a>:<l>"    pollutant `a` (index into Config.pollutants) at level `l`; level STEPS is fully tainted
+--   "b<a>:<b>:<k>" fully tainted, a blend of pollutants a < b with `k` of STEPS parts being `b`
+local function pure_key(a, level) return "p" .. a .. ":" .. level end
+
+-- A fully tainted tint on the line between pollutants x < y, `k` steps of the way to y.
+local function full_key(x, y, k)
+  if not y or k <= 0 then return pure_key(x, STEPS) end
+  if k >= STEPS then return pure_key(y, STEPS) end
+  return "b" .. x .. ":" .. y .. ":" .. k
+end
+
 local function build_maps()
   local m =
   {
-    info = {},       -- tile name -> {clean = clean tile name, pollutant = fluid name or nil}
+    info = {},       -- tile name -> {clean = clean tile name, a, b, k, level, pollutant = fluid it yields}; only `clean` for clean water
+    tile_for = {},   -- clean tile name -> tint key -> tile name
     waterish = {},   -- every clean or tainted water tile name
     tainted = {},    -- every tainted tile name
-    variant = {},    -- pollutant -> {clean tile name -> tainted tile name}
-    not_paint = {},  -- pollutant -> every water tile name that is not this pollutant's
-    foreign = {},    -- pollutant -> every tainted tile name that is not this pollutant's
+    needs = {},      -- target signature -> {any = names, free = names}; filled on demand by `needs`
     fluids = {},     -- dumpable fluid name -> {pollutant = fluid name, potency = n, dilution = n}
+    index = {},      -- pollutant fluid name -> index into Config.pollutants
     order = {}       -- pollutants in config order; ties in dominance go to the earlier one
   }
 
@@ -63,50 +83,39 @@ local function build_maps()
     local fluid = tile.fluid
     if fluid and fluid.name == "water" then clean[#clean + 1] = name end
   end
+  table.sort(clean)
+
+  local used = {}
   for _, name in ipairs(clean) do
     m.info[name] = {clean = name}
+    m.tile_for[name] = {clean = name}
     m.waterish[#m.waterish + 1] = name
+    for _, variant in ipairs(Variants.for_source(name)) do
+      if prototypes.tile[variant.name] then
+        local key = variant.b and full_key(variant.a, variant.b, variant.k) or pure_key(variant.a, variant.level)
+        local dominant = Variants.dominant(variant)
+        m.info[variant.name] = {clean = name, a = variant.a, b = variant.b, k = variant.k, level = variant.level, pollutant = Config.pollutants[dominant].fluid}
+        m.tile_for[name][key] = variant.name
+        m.waterish[#m.waterish + 1] = variant.name
+        m.tainted[#m.tainted + 1] = variant.name
+        used[variant.a] = true
+      end
+    end
   end
 
-  for _, pollutant in ipairs(Config.pollutants) do
+  for index, pollutant in ipairs(Config.pollutants) do
     local fluid = pollutant.fluid
-    if prototypes.fluid[fluid] then
-      local variant, any = {}, false
-      for _, name in ipairs(clean) do
-        local tainted = Config.tainted_tile(fluid, name)
-        if prototypes.tile[tainted] then
-          variant[name] = tainted
-          any = true
-          m.info[tainted] = {clean = name, pollutant = fluid}
-          m.waterish[#m.waterish + 1] = tainted
-          m.tainted[#m.tainted + 1] = tainted
-        end
-      end
-      if any then
-        local potency = pollutant.potency or 1
-        m.variant[fluid] = variant
-        m.order[#m.order + 1] = fluid
-        m.fluids[fluid] = {pollutant = fluid, potency = potency, dilution = 1}
-        local tainted_fluid = Config.tainted_fluid(fluid)
-        if prototypes.fluid[tainted_fluid] then
-          local dilution = Config.tainted_water_potency
-          m.fluids[tainted_fluid] = {pollutant = fluid, potency = potency * dilution, dilution = dilution}
-        end
+    if used[index] and prototypes.fluid[fluid] then
+      local potency = pollutant.potency or 1
+      m.index[fluid] = index
+      m.order[#m.order + 1] = fluid
+      m.fluids[fluid] = {pollutant = fluid, potency = potency, dilution = 1}
+      local tainted_fluid = Config.tainted_fluid(fluid)
+      if prototypes.fluid[tainted_fluid] then
+        local dilution = Config.tainted_water_potency
+        m.fluids[tainted_fluid] = {pollutant = fluid, potency = potency * dilution, dilution = dilution}
       end
     end
-  end
-
-  for _, pollutant in ipairs(m.order) do
-    local not_paint, foreign = {}, {}
-    for _, name in ipairs(m.waterish) do
-      local other = m.info[name].pollutant
-      if other ~= pollutant then
-        not_paint[#not_paint + 1] = name
-        if other then foreign[#foreign + 1] = name end
-      end
-    end
-    m.not_paint[pollutant] = not_paint
-    m.foreign[pollutant] = foreign
   end
 
   return m
@@ -115,6 +124,90 @@ end
 local function get_maps()
   if not maps then maps = build_maps() end
   return maps
+end
+
+--------------------------------------------------------------------------------
+-- Tints: one step at a time
+--------------------------------------------------------------------------------
+
+-- One step along the line between pollutants x < y, from `k` toward `goal`.
+local function step_toward(x, y, k, goal)
+  if k < goal then return full_key(x, y, k + 1) end
+  if k > goal then return full_key(x, y, k - 1) end
+end
+
+-- One step from pollutant p, fully tainted, toward pollutant q.
+local function slide(p, q)
+  if p < q then return full_key(p, q, 1) end
+  return full_key(q, p, STEPS - 1)
+end
+
+-- The next tint of a tile on its way to the group's `target`, and whether that step costs
+-- pollutant. Returns nil once the tile shows the target.
+--   target = {a, b, k, dominant, signature}: pollutants a < b blended k of STEPS toward b
+--   (b is nil and k is 0 for a single pollutant); `dominant` is the one new water is tainted with.
+local function next_taint(info, target)
+  local a, b, k = target.a, target.b, target.k
+  -- clean water, or water not yet fully tainted: one level stronger, in the dominant pollutant
+  if not info.a then return pure_key(target.dominant, 1), true end
+  if not info.b and info.level < STEPS then
+    if info.a == target.dominant then return pure_key(info.a, info.level + 1), true end
+    -- faint water of another pollutant takes the dominant one's colour at the same strength
+    return pure_key(target.dominant, info.level), false
+  end
+
+  -- Fully tainted water moves along blends, for free.
+  local x, y = info.a, info.b
+  if not y then
+    if not b then
+      if x == a then return nil end
+      return slide(x, a), false
+    end
+    if x == a then return step_toward(a, b, 0, k), false end
+    if x == b then return step_toward(a, b, STEPS, k), false end
+    return slide(x, target.dominant), false
+  end
+  if x == a and y == b then return step_toward(x, y, info.k, k), false end
+  -- a blend that is not the target's: first back to whichever of its pollutants the target
+  -- has, or else its larger one
+  local goal
+  if x == a or x == b then goal = 0
+  elseif y == a or y == b then goal = STEPS
+  elseif info.k <= STEPS / 2 then goal = 0
+  else goal = STEPS end
+  return step_toward(x, y, info.k, goal), false
+end
+
+-- The next tint of a tile being treated with chlorine, and whether the step takes pollutant out
+-- of the water (rather than only unmixing a blend). Returns nil for clean water.
+local function next_clean(info)
+  if not info.a then return nil end
+  if not info.b then
+    if info.level <= 1 then return "clean", true end
+    return pure_key(info.a, info.level - 1), true
+  end
+  -- a blend first settles on its larger pollutant, then fades
+  if info.k <= STEPS / 2 then return full_key(info.a, info.b, info.k - 1), false end
+  return full_key(info.a, info.b, info.k + 1), false
+end
+
+-- The water tile names that still have a step to take toward `target`: `any` for when the
+-- outfall can pay, `free` for the steps that cost nothing.
+local function needs(m, target)
+  local cached = m.needs[target.signature]
+  if cached then return cached end
+  local any, free = {}, {}
+  for _, name in ipairs(m.waterish) do
+    local info = m.info[name]
+    local tint, costs = next_taint(info, target)
+    if tint and m.tile_for[info.clean][tint] then
+      any[#any + 1] = name
+      if not costs then free[#free + 1] = name end
+    end
+  end
+  cached = {any = any, free = free}
+  m.needs[target.signature] = cached
+  return cached
 end
 
 --------------------------------------------------------------------------------
@@ -433,7 +526,7 @@ end
 -- Empties the outfall's tank into its ledgers.
 local function drain(outfall, tick, settings_now, m)
   local entity = outfall.entity
-  local chlorine_cap = settings_now.chlorine_per_tile * T.max_tiles_per_update
+  local chlorine_cap = settings_now.chlorine_per_tile / STEPS * T.max_tiles_per_update
   outfall.sees_chlorine = false
 
   for index = 1, entity.fluids_count do
@@ -463,12 +556,14 @@ local function drain(outfall, tick, settings_now, m)
 end
 
 local function taint_step(outfall, tick, settings_now, m, surface)
-  local paint = outfall.paint
-  local paid = total(outfall.pending) >= settings_now.units_per_tile
-  -- With pollutant to spend, any water that is not already this colour is a target.
-  -- Without, only tiles showing another pollutant are: repainting those is free.
-  local tag = (paid and "taint|" or "repaint|") .. paint
-  local names = paid and m.not_paint[paint] or m.foreign[paint]
+  local target = outfall.target
+  local cost = settings_now.units_per_tile / STEPS
+  local paid = total(outfall.pending) >= cost
+  -- With pollutant to spend, any water that does not show the target yet is a target.
+  -- Without, only the steps that cost nothing are: blending fully tainted water.
+  local tag = (paid and "taint|" or "repaint|") .. target.signature
+  local need = needs(m, target)
+  local names = paid and need.any or need.free
 
   local result = refill(outfall, outfall.taint, tag, names, settings_now, tick, surface, m, not paid)
   if result ~= "ok" then
@@ -485,23 +580,28 @@ local function taint_step(outfall, tick, settings_now, m, surface)
     return
   end
 
-  local variant = m.variant[paint]
-  local cost = settings_now.units_per_tile
+  -- Every tile in the queue takes one step. The queue is only searched again once it is used
+  -- up, so no tile takes a second step before every other tile has had its first.
   local queue, qi, count = outfall.queue, outfall.qi, 0
   local reach = outfall.reach
   local tiles = {}
   while qi <= #queue and count < T.max_tiles_per_update do
     local x, y = unkey(queue[qi])
-    local name = surface.get_tile(x, y).name
-    local info = m.info[name]
-    local target = info and variant[info.clean]
-    if target and target ~= name then
-      if not info.pollutant and not pay(outfall, cost) then break end
-      count = count + 1
-      tiles[count] = {name = target, position = {x, y}}
-      local dx, dy = x + 0.5 - outfall.x, y + 0.5 - outfall.y
-      local distance = math.sqrt(dx * dx + dy * dy)
-      if distance > reach then reach = distance end
+    local info = m.info[surface.get_tile(x, y).name]
+    local tint, costs
+    if info then tint, costs = next_taint(info, target) end
+    local name = tint and m.tile_for[info.clean][tint]
+    if name then
+      if costs and not pay(outfall, cost) then
+        -- out of pollutant: wait for more, unless only free steps were wanted anyway
+        if paid then break end
+      else
+        count = count + 1
+        tiles[count] = {name = name, position = {x, y}}
+        local dx, dy = x + 0.5 - outfall.x, y + 0.5 - outfall.y
+        local distance = math.sqrt(dx * dx + dy * dy)
+        if distance > reach then reach = distance end
+      end
     end
     qi = qi + 1
   end
@@ -516,7 +616,7 @@ local function clean_step(outfall, tick, settings_now, m, surface)
     set_status(outfall, "blocked", "red")
     return
   end
-  local cost = settings_now.chlorine_per_tile
+  local cost = settings_now.chlorine_per_tile / STEPS
   if outfall.chlorine < cost then
     set_status(outfall, "treating", "green")
     return
@@ -535,15 +635,21 @@ local function clean_step(outfall, tick, settings_now, m, surface)
     return
   end
 
-  local queue, qi, count = outfall.queue, outfall.qi, 0
+  -- Like tainting, every tile in the queue takes one step: one level weaker, or a blend
+  -- settling on its larger pollutant.
+  local queue, qi, count, levels = outfall.queue, outfall.qi, 0, 0
   local tiles = {}
   while qi <= #queue and count < T.max_tiles_per_update and outfall.chlorine >= cost do
     local x, y = unkey(queue[qi])
     local info = m.info[surface.get_tile(x, y).name]
-    if info and info.pollutant then
+    local tint, removes
+    if info then tint, removes = next_clean(info) end
+    local name = tint and m.tile_for[info.clean][tint]
+    if name then
       count = count + 1
-      tiles[count] = {name = info.clean, position = {x, y}}
+      tiles[count] = {name = name, position = {x, y}}
       outfall.chlorine = outfall.chlorine - cost
+      if removes then levels = levels + 1 end
     end
     qi = qi + 1
   end
@@ -551,7 +657,7 @@ local function clean_step(outfall, tick, settings_now, m, surface)
 
   if count > 0 then
     apply_tiles(surface, tiles, false)
-    settle_ledgers(outfall, count * settings_now.units_per_tile)
+    settle_ledgers(outfall, levels * settings_now.units_per_tile / STEPS)
   end
   set_status(outfall, "treating", "green")
 end
@@ -567,9 +673,9 @@ local function act(outfall, tick, settings_now, m)
     end
   end
 
-  if outfall.paint and (outfall.repaint or total(outfall.pending) >= settings_now.units_per_tile) then
+  if outfall.target and (outfall.repaint or total(outfall.pending) >= settings_now.units_per_tile / STEPS) then
     taint_step(outfall, tick, settings_now, m, surface)
-  elseif outfall.sees_chlorine or outfall.chlorine >= settings_now.chlorine_per_tile then
+  elseif outfall.sees_chlorine or outfall.chlorine >= settings_now.chlorine_per_tile / STEPS then
     clean_step(outfall, tick, settings_now, m, surface)
   elseif outfall.last_dump_tick and tick - outfall.last_dump_tick <= T.update_interval * 2 then
     set_status(outfall, "dumping", "green")
@@ -589,7 +695,7 @@ local function assign_groups(tick, settings_now, m)
       count = count + 1
       polluters[count] = outfall
     else
-      outfall.paint, outfall.repaint, outfall.group_active = nil, false, false
+      outfall.target, outfall.repaint, outfall.group_active = nil, false, false
     end
   end
 
@@ -631,17 +737,44 @@ local function assign_groups(tick, settings_now, m)
     if outfall.last_dump_tick and tick - outfall.last_dump_tick <= settings_now.taint_ticks then active[root] = true end
   end
 
+  -- Each group heads for a blend of its two biggest pollutants, in proportion to how much of
+  -- each it has dumped, rounded to the nearest step.
+  local targets = {}
   for index = 1, count do
     local outfall, root = polluters[index], find(index)
-    local sums = totals[root]
-    local dominant, most
-    for _, pollutant in ipairs(m.order) do
-      local amount = sums[pollutant]
-      if amount and amount > 0 and (not most or amount > most) then dominant, most = pollutant, amount end
+    local target = targets[root]
+    if target == nil then
+      local sums = totals[root]
+      local first, second
+      for _, pollutant in ipairs(m.order) do
+        local amount = sums[pollutant]
+        if amount and amount > 0 then
+          if not first or amount > sums[first] then
+            first, second = pollutant, first
+          elseif not second or amount > sums[second] then
+            second = pollutant
+          end
+        end
+      end
+      target = false
+      if first then
+        local dominant = m.index[first]
+        local share = second and math.floor(STEPS * sums[second] / (sums[first] + sums[second]) + 0.5) or 0
+        if share == 0 then
+          target = {a = dominant, k = 0, dominant = dominant, signature = tostring(dominant)}
+        else
+          local other = m.index[second]
+          local a, b = math.min(dominant, other), math.max(dominant, other)
+          local k = b == other and share or STEPS - share
+          target = {a = a, b = b, k = k, dominant = dominant, signature = a .. ":" .. b .. ":" .. k}
+        end
+      end
+      targets[root] = target
     end
-    if dominant ~= outfall.paint then
-      outfall.paint = dominant
-      outfall.repaint = dominant ~= nil
+    local signature = target and target.signature
+    if signature ~= (outfall.target and outfall.target.signature) then
+      outfall.target = target or nil
+      outfall.repaint = target and true or false
     end
     outfall.group_active = active[root] or false
   end
@@ -722,10 +855,11 @@ script.on_configuration_changed(function(data)
     outfall.taint, outfall.clean = new_search(), new_search()
     for _, ledger in pairs({outfall.pending, outfall.load}) do
       for pollutant in pairs(ledger) do
-        if not m.variant[pollutant] then ledger[pollutant] = nil end
+        if not m.index[pollutant] then ledger[pollutant] = nil end
       end
     end
-    if outfall.paint and not m.variant[outfall.paint] then outfall.paint = nil end
+    -- worked out again on the next update; `paint` is what saves before 0.1.2 kept instead
+    outfall.target, outfall.repaint, outfall.paint = nil, false, nil
   end
 end)
 
@@ -763,7 +897,7 @@ commands.add_command("cp-status", {"cp-command.status-help"}, function(command)
   player.print(serpent.line(
   {
     status = outfall.status,
-    paint = outfall.paint,
+    target = outfall.target and outfall.target.signature,
     pending = outfall.pending,
     load = outfall.load,
     chlorine = outfall.chlorine,

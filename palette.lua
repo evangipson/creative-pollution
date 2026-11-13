@@ -91,6 +91,16 @@ function Palette.brighten(color, amount)
     return brightened_color
 end
 
+---Mixes two colors.
+---@param from table The color at `amount` 0.
+---@param to table The color at `amount` 1.
+---@param amount number How far to go from `from` toward `to` (0.0 - 1.0).
+---@return table # The mixed color in `{r, g, b, a}` shape.
+function Palette.mix(from, to, amount)
+	local a, b = Palette.get_rgba(from), Palette.get_rgba(to)
+	return {r = a.r + (b.r - a.r) * amount, g = a.g + (b.g - a.g) * amount, b = a.b + (b.b - a.b) * amount, a = a.a + (b.a - a.a) * amount}
+end
+
 ---Gets the "peak" of the color (i.e.: the value of the most intense color channel)
 ---@param color table The color to get the peak of.
 ---@return number # The value of the most intense color channel.
