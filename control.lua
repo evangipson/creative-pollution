@@ -326,7 +326,10 @@ local SEARCH_PUMPS = {"offshore-pump"}
 local SEARCH_PUMPS_AND_FISH = {"offshore-pump", "fish"}
 
 local function apply_tiles(surface, tiles, tainting)
-  surface.set_tiles(tiles, false, false, false, false)
+  -- Tile correction must stay on: it is also what redraws the shoreline of the land around the
+  -- changed tiles. Without it the land's edge is not drawn over them and every tile at the coast
+  -- shows as a hard square. It never changes the tiles around them.
+  surface.set_tiles(tiles, true, false, false, false)
 
   local types = (tainting and T.kill_fish) and SEARCH_PUMPS_AND_FISH or SEARCH_PUMPS
   local pumps
@@ -690,10 +693,30 @@ script.on_nth_tick(T.update_interval, update)
 
 script.on_init(register_all)
 
-script.on_configuration_changed(function()
+-- Up to 0.1.1 tiles were placed without tile correction, so the coast around them has no
+-- shoreline. Placing the same tiles again with correction draws it. Only the water an outfall can
+-- have reached is touched.
+local function redraw_shorelines(m)
+  local max_radius = settings.global["cp-max-slick-radius"].value + T.margin
+  for _, outfall in pairs(storage.outfalls) do
+    local entity = outfall.entity
+    if entity.valid then
+      local found = entity.surface.find_tiles_filtered({position = entity.position, radius = max_radius, name = m.waterish})
+      local tiles = {}
+      for index = 1, #found do tiles[index] = {name = found[index].name, position = found[index].position} end
+      if #tiles > 0 then entity.surface.set_tiles(tiles, true, false, false, false) end
+    end
+  end
+end
+
+script.on_configuration_changed(function(data)
   register_all()
   -- Tile and fluid names may have changed with the mod set: drop anything derived from them.
   local m = get_maps()
+  local change = data.mod_changes and data.mod_changes[script.mod_name]
+  if change and change.old_version and helpers.compare_versions(change.old_version, "0.1.2") < 0 then
+    redraw_shorelines(m)
+  end
   for _, outfall in pairs(storage.outfalls) do
     outfall.queue, outfall.queue_tag, outfall.origin = nil, nil, nil
     outfall.taint, outfall.clean = new_search(), new_search()
